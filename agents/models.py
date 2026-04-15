@@ -232,6 +232,7 @@ class TechStrategyState(TypedDict, total=False):
     threat_analysis: Annotated[list[dict[str, Any]], merge_unique_list]
     references: Annotated[list[str], merge_unique_list]
     reference_items: Annotated[list[dict[str, Any]], merge_unique_list]
+    rag_sources: Annotated[list[str], merge_unique_list]
     report_draft: str
     quality_scores: Annotated[dict[str, Any], merge_dict]
     quality_gate: str
@@ -262,6 +263,7 @@ def build_initial_state(topic: str, user_request: str, max_iterations: int) -> T
         threat_analysis=[],
         references=[],
         reference_items=[],
+        rag_sources=[],
         report_draft="",
         quality_scores={},
         quality_gate="unknown",

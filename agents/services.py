@@ -247,6 +247,12 @@ class PaperIngestionService:
                 pdf_path = self._download_pdf(pdf_url, data_dir=data_dir)
                 paper_docs = self._load_pdf_documents(pdf_path)
                 title = paper_docs[0].metadata.get("title", url) if paper_docs else url
+                for doc in paper_docs:
+                    metadata = dict(getattr(doc, "metadata", {}) or {})
+                    metadata["source"] = url
+                    metadata["pdf_url"] = pdf_url
+                    metadata["file_path"] = str(pdf_path)
+                    doc.metadata = metadata
                 ingested.append(
                     IngestedPaper(
                         url=url,

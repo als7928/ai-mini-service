@@ -225,11 +225,16 @@ class DomainKnowledgeNode(BaseNode):
     @ensure_state_keys(["target_technologies"])
     def run(self, state: dict[str, Any]) -> dict[str, Any]:
         domain_context: dict[str, list[str]] = {}
+        rag_sources: list[str] = []
         key_terms = [*state["target_technologies"], "TRL framework", "HBM bandwidth", "PIM energy efficiency", "CXL"]
 
         for term in key_terms:
             docs = self.vector_service.retrieve(query=term, k=self.config.top_k_retrieval)
             snippets = [doc.page_content[:500] for doc in docs if doc.page_content]
+            for doc in docs:
+                source = str(getattr(doc, "metadata", {}).get("source", "")).strip()
+                if source.startswith("http"):
+                    rag_sources.append(source)
 
             # 벡터 검색 결과가 없으면 LLM으로 최소 배경 설명을 생성한다.
             if not snippets:
@@ -242,7 +247,7 @@ class DomainKnowledgeNode(BaseNode):
                 snippets = [str(fallback).strip()]
             domain_context[term] = snippets
 
-        return {"phase": "domain_enriched", "domain_context": domain_context}
+        return {"phase": "domain_enriched", "domain_context": domain_context, "rag_sources": rag_sources}
 
 
 class CompetitorProfilerNode(BaseNode):
@@ -275,9 +280,23 @@ class CompetitorProfilerNode(BaseNode):
                         ),
                     ]
                 )
-                profiles[key] = profile.model_dump()
+                profile_data = profile.model_dump()
+                if not profile_data.get("key_sources"):
+                    profile_data["key_sources"] = self._extract_source_urls(related_items)[:8]
+                profiles[key] = profile_data
 
         return {"phase": "profiled", "competitor_profiles": profiles}
+
+    def _extract_source_urls(self, related_items: list[dict[str, Any]]) -> list[str]:
+        urls: list[str] = []
+        seen: set[str] = set()
+        for item in related_items:
+            url = str(item.get("url", "")).strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+        return urls
 
     def _filter_related_items(
         self,
@@ -346,7 +365,11 @@ class TRLAssessorNode(BaseNode):
         return (
             f"[Profile]\n{json.dumps(profile, ensure_ascii=False, indent=2)}\n\n"
             f"[TRL Context]\n{json.dumps(domain_context.get('TRL framework', []), ensure_ascii=False, indent=2)}\n\n"
-            "TRL 1~9 중 하나를 선택하고, 4~6이면 assessment_basis='indirect'로 표시하라."
+            "TRL 1~9 중 하나를 선택하고, 4~6이면 assessment_basis='indirect'로 표시하라.\n"
+            "추가 규칙:\n"
+            "- evidence는 최소 2개 이상 작성하라. 각 항목은 가능한 한 구체적인 관찰/사실 + 출처 URL을 포함하라.\n"
+            "- assessment_note에 '왜 그 TRL인지'를 2~3문장으로 요약하라.\n"
+            "- information_gaps는 최소 1개 이상 작성하라."
         )
 
     def _build_threat_prompt(self, profile: dict[str, Any], assessment: dict[str, Any]) -> str:
@@ -460,6 +483,7 @@ class ReportSynthesizerNode(BaseNode):
         system_prompt = self.prompts.read("report_synthesizer_system.txt")
         citation_catalog = self._build_citation_catalog(state)
         retrieval_metrics = self._extract_retrieval_metrics(state)
+        rag_sources = set(str(url).strip() for url in state.get("rag_sources", []) if str(url).strip())
 
         report_markdown = self.llm.invoke(
             [
@@ -485,10 +509,15 @@ class ReportSynthesizerNode(BaseNode):
         report_text = self._strip_existing_reference_sections(report_text)
         report_text = self._enforce_business_focus_sections(report_text)
         report_text = self._inject_retrieval_metrics(report_text, retrieval_metrics)
+        report_text = self._inject_trl_rationale(
+            report_text=report_text,
+            assessments=state.get("trl_assessments", []),
+            citation_catalog=citation_catalog,
+        )
         if "[" not in report_text:
             report_text = report_text + "\n\n> 참고 근거 인용 번호가 누락되어 자동으로 보강되었습니다. [1]"
 
-        report_text = self._replace_reference_section(report_text, citation_catalog)
+        report_text = self._replace_reference_section(report_text, citation_catalog, rag_sources=rag_sources)
 
         return {
             "phase": "report_drafted",
@@ -527,11 +556,12 @@ class ReportSynthesizerNode(BaseNode):
             "4. 3. 경쟁사 동향 분석\n"
             "   - ### 경쟁사별 비교: 다음 항목을 모두 포함한 표와 설명\n"
             "     * 기술 | 경쟁사 | TRL | 서브레벨 | 신뢰도 | 위협도 | 차별화 전략\n"
+            "   - ### TRL 판단 근거: 각 (기술, 경쟁사) 조합별로 '왜 그 TRL인지'를 근거 2개 이상 + 정보 공백 1개 이상으로 제시\n"
             "5. 4. 전략적 시사점\n"
             "   - ### 종합 시사점: TRL 기반 순위, 위협 수준별 대응 계획, 투자 우선순위\n"
             "6. ### 신뢰성 메트릭\n"
             "   - Hit@1, Hit@3, Hit@5, MRR 값이 포함된 표\n"
-            "7. REFERENCE: APA 스타일, [n] 순서대로 정렬\n\n"
+            "7. REFERENCE: (작성하지 말 것) 본문에서 [n] 인용만 유지하라. REFERENCE 섹션은 시스템이 생성한다.\n\n"
             "=== 중요 요구사항 ===\n"
             "- 모든 주장에 [n] 인용 번호를 부착하라\n"
             "- 경쟁사별 기술 성숙도를 정량적으로 비교하는 표를 포함하라\n"
@@ -592,6 +622,112 @@ class ReportSynthesizerNode(BaseNode):
 
         return report_text.rstrip() + "\n" + table
 
+    def _inject_trl_rationale(
+        self,
+        report_text: str,
+        assessments: list[dict[str, Any]],
+        citation_catalog: list[dict[str, Any]],
+    ) -> str:
+        """TRL 판단 근거 섹션을 보고서에 삽입한다(없으면)."""
+        if "TRL 판단 근거" in report_text:
+            return report_text
+        block = self._build_trl_rationale_block(assessments=assessments, citation_catalog=citation_catalog)
+        if not block:
+            return report_text
+
+        insert_pattern = re.compile(r"^[ \t]*#{1,6}\s*4\.\s*전략적 시사점", flags=re.MULTILINE)
+        match = insert_pattern.search(report_text)
+        if not match:
+            return report_text.rstrip() + "\n\n" + block
+        return (
+            report_text[: match.start()].rstrip()
+            + "\n\n"
+            + block
+            + "\n\n"
+            + report_text[match.start() :].lstrip()
+        )
+
+    def _build_trl_rationale_block(
+        self,
+        assessments: list[dict[str, Any]],
+        citation_catalog: list[dict[str, Any]],
+    ) -> str:
+        """TRL 판단 근거 섹션 마크다운을 생성한다."""
+        if not assessments:
+            return ""
+
+        def as_float(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except Exception:  # noqa: BLE001
+                return default
+
+        lines: list[str] = []
+        lines.append("### TRL 판단 근거")
+        for item in assessments:
+            if not isinstance(item, dict):
+                continue
+            technology = str(item.get("technology", "")).strip()
+            competitor = str(item.get("competitor", "")).strip()
+            trl_level = str(item.get("trl_level", "")).strip()
+            trl_sublevel = str(item.get("trl_sublevel", "")).strip()
+            basis = str(item.get("assessment_basis", "")).strip()
+            confidence = as_float(item.get("confidence", 0.0), 0.0)
+            note = str(item.get("assessment_note", "")).strip()
+            evidence = item.get("evidence", [])
+            gaps = item.get("information_gaps", [])
+
+            header = f"- **{technology} / {competitor}**: TRL {trl_level} ({trl_sublevel}), basis={basis}, confidence={confidence:.2f}"
+            lines.append(header)
+            if note:
+                lines.append(f"  - 판단 요약: {note}")
+
+            if isinstance(evidence, list) and evidence:
+                lines.append("  - 근거:")
+                for ev in evidence[:3]:
+                    ev_text = str(ev).strip()
+                    if not ev_text:
+                        continue
+                    ev_text = self._append_catalog_citation(ev_text, citation_catalog)
+                    lines.append(f"    - {ev_text}")
+
+            if isinstance(gaps, list) and gaps:
+                gap_texts = [str(g).strip() for g in gaps if str(g).strip()]
+                if gap_texts:
+                    lines.append(f"  - 정보 공백: {', '.join(gap_texts[:3])}")
+
+        return "\n".join(lines).strip()
+
+    def _append_catalog_citation(self, text: str, citation_catalog: list[dict[str, Any]]) -> str:
+        """evidence 문장에 포함된 URL을 citation_catalog와 매칭해 [id] 인용을 덧붙인다."""
+        if re.search(r"\[\d+\]", text):
+            return text
+
+        urls = re.findall(r"https?://\\S+", text)
+        if not urls:
+            return text
+
+        def normalize(url: str) -> str:
+            cleaned = url.strip()
+            cleaned = cleaned.rstrip(").,;]>\"'")
+            return cleaned.rstrip("/")
+
+        normalized_urls = [normalize(url) for url in urls]
+        for entry in citation_catalog:
+            try:
+                entry_id = int(entry.get("id", 0))
+            except Exception:  # noqa: BLE001
+                continue
+            entry_url = normalize(str(entry.get("url", "")).strip())
+            if not entry_url or entry_id <= 0:
+                continue
+            for candidate in normalized_urls:
+                if not candidate:
+                    continue
+                if candidate == entry_url or candidate.startswith(entry_url) or entry_url.startswith(candidate):
+                    return f"{text} [{entry_id}]"
+        return text
+
     def _build_citation_catalog(self, state: dict[str, Any]) -> list[dict[str, Any]]:
         """보고서 본문에서 사용할 번호 기반 인용 카탈로그를 생성한다."""
         candidate_items = state.get("reference_items", [])
@@ -638,20 +774,26 @@ class ReportSynthesizerNode(BaseNode):
 
         return text.strip()
 
-    def _replace_reference_section(self, report_text: str, citation_catalog: list[dict[str, Any]]) -> str:
-        """REFERENCE 섹션을 번호+APA 스타일로 강제 정규화한다."""
+    def _replace_reference_section(
+        self,
+        report_text: str,
+        citation_catalog: list[dict[str, Any]],
+        rag_sources: set[str] | None = None,
+    ) -> str:
+        """REFERENCE 섹션을 번호+APA 스타일로 정규화하고, WEB/RAG로 분리해 출력한다."""
         report_text = self._strip_existing_reference_sections(report_text)
-        normalized_text, ordered_sources = self._normalize_citation_numbers(report_text, citation_catalog)
+        normalized_text, ordered_sources = self._normalize_citation_numbers(
+            report_text, citation_catalog, rag_sources=rag_sources
+        )
         apa_lines = self._build_apa_references(ordered_sources)
         marker = "## REFERENCE"
-        # Markdown 렌더러가 줄바꿈을 합쳐버리는 경우가 있어, blockquote + hard line break로 강제한다.
-        quoted = [f"> {line}  " for line in apa_lines]
-        return f"{normalized_text.rstrip()}\n\n{marker}\n{chr(10).join(quoted)}"
+        return f"{normalized_text.rstrip()}\n\n{marker}\n{self._format_reference_sections(apa_lines, ordered_sources, rag_sources)}"
 
     def _normalize_citation_numbers(
         self,
         report_text: str,
         citation_catalog: list[dict[str, Any]],
+        rag_sources: set[str] | None = None,
     ) -> tuple[str, list[dict[str, Any] | None]]:
         """본문 인용 번호를 [1..N]으로 재배열하고 대응 출처 목록을 만든다."""
         found_ids: list[int] = []
@@ -665,15 +807,31 @@ class ReportSynthesizerNode(BaseNode):
 
         catalog_map = {int(item.get("id", 0)): item for item in citation_catalog if int(item.get("id", 0)) > 0}
         unused_catalog = [catalog_map[key] for key in sorted(catalog_map.keys())]
-        chosen_sources: list[dict[str, Any] | None] = []
         old_to_new: dict[int, int] = {}
 
-        for idx, old_id in enumerate(found_ids, start=1):
-            old_to_new[old_id] = idx
+        source_by_old: dict[int, dict[str, Any] | None] = {}
+        for old_id in found_ids:
             source = catalog_map.get(old_id)
             if source is None and unused_catalog:
                 source = unused_catalog.pop(0)
-            chosen_sources.append(source)
+            source_by_old[old_id] = source
+
+        rag_sources = rag_sources or set()
+
+        def is_rag(source: dict[str, Any] | None) -> bool:
+            if not source:
+                return False
+            url = str(source.get("url", "")).strip()
+            return bool(url and url in rag_sources)
+
+        web_old_ids = [old_id for old_id in found_ids if not is_rag(source_by_old.get(old_id))]
+        rag_old_ids = [old_id for old_id in found_ids if is_rag(source_by_old.get(old_id))]
+        grouped_old_ids = [*web_old_ids, *rag_old_ids]
+
+        chosen_sources: list[dict[str, Any] | None] = []
+        for idx, old_id in enumerate(grouped_old_ids, start=1):
+            old_to_new[old_id] = idx
+            chosen_sources.append(source_by_old.get(old_id))
 
         def repl(match: re.Match[str]) -> str:
             old = int(match.group(1))
@@ -682,6 +840,45 @@ class ReportSynthesizerNode(BaseNode):
 
         normalized_text = re.sub(r"\[(\d+)\]", repl, report_text)
         return normalized_text, chosen_sources
+
+    def _format_reference_sections(
+        self,
+        apa_lines: list[str],
+        ordered_sources: list[dict[str, Any] | None],
+        rag_sources: set[str] | None,
+    ) -> str:
+        """REFERENCE를 WEB/RAG 두 섹션으로 나눠 출력한다."""
+        rag_sources = rag_sources or set()
+        web_lines: list[str] = []
+        rag_lines: list[str] = []
+
+        def is_rag_line(source: dict[str, Any] | None) -> bool:
+            if not source:
+                return False
+            url = str(source.get("url", "")).strip()
+            return bool(url and url in rag_sources)
+
+        for line, source in zip(apa_lines, ordered_sources, strict=False):
+            # Markdown 렌더러가 줄바꿈을 합쳐버리는 경우가 있어, blockquote + hard line break로 강제한다.
+            formatted = f"> {line}  "
+            if is_rag_line(source):
+                rag_lines.append(formatted)
+            else:
+                web_lines.append(formatted)
+
+        chunks: list[str] = []
+        if web_lines:
+            chunks.append("### WEB SEARCH")
+            chunks.extend(web_lines)
+        if rag_lines:
+            if chunks:
+                chunks.append("")
+            chunks.append("### RAG (Vector DB)")
+            chunks.extend(rag_lines)
+
+        if not chunks:
+            return "> [1] Author Unknown. (n.d.). Untitled. Retrieved from unknown source  "
+        return "\n".join(chunks).rstrip()
 
     def _build_apa_references(self, ordered_sources: list[dict[str, Any] | None]) -> list[str]:
         """APA 스타일 레퍼런스를 생성한다 (저자/기관. 연도. 제목. 출처)."""
