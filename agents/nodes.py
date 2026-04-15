@@ -484,6 +484,10 @@ class ReportSynthesizerNode(BaseNode):
         citation_catalog = self._build_citation_catalog(state)
         retrieval_metrics = self._extract_retrieval_metrics(state)
         rag_sources = set(str(url).strip() for url in state.get("rag_sources", []) if str(url).strip())
+        references_for_prompt = self._merge_reference_urls(
+            state.get("references", []),
+            sorted(rag_sources),
+        )
 
         report_markdown = self.llm.invoke(
             [
@@ -494,7 +498,7 @@ class ReportSynthesizerNode(BaseNode):
                         collected_data=state["collected_data"],
                         assessments=state["trl_assessments"],
                         threats=state["threat_analysis"],
-                        references=state.get("references", []),
+                        references=references_for_prompt,
                         citation_catalog=citation_catalog,
                         retrieval_metrics=retrieval_metrics,
                         feedback=feedback,
@@ -507,7 +511,17 @@ class ReportSynthesizerNode(BaseNode):
         # LLM이 생성한 REFERENCE/REFERENCES 섹션(번호/형식 혼재 포함)은 모두 제거하고,
         # 마지막에 단일 `## REFERENCE` 섹션을 재구성한다.
         report_text = self._strip_existing_reference_sections(report_text)
+        # LLM이 종종 인용 자리표시자([n])를 그대로 출력하므로, 숫자 인용으로 정규화한다.
+        report_text = self._replace_placeholder_citations(report_text, max_citation_id=max(1, len(citation_catalog)))
         report_text = self._enforce_business_focus_sections(report_text)
+        report_text = self._inject_competitor_comparison_table(
+            report_text=report_text,
+            assessments=state.get("trl_assessments", []),
+            threats=state.get("threat_analysis", []),
+            competitor_profiles=state.get("competitor_profiles", {}),
+            target_technologies=state.get("target_technologies", []),
+            target_competitors=state.get("target_competitors", []),
+        )
         report_text = self._inject_retrieval_metrics(report_text, retrieval_metrics)
         report_text = self._inject_trl_rationale(
             report_text=report_text,
@@ -524,6 +538,23 @@ class ReportSynthesizerNode(BaseNode):
             "report_draft": report_text,
             "revision_feedback": [],
         }
+
+    def _merge_reference_urls(self, left: Any, right: Any) -> list[str]:
+        """레퍼런스 URL 리스트를 순서를 유지하며 병합한다."""
+        merged: list[str] = []
+        seen: set[str] = set()
+
+        for seq in (left, right):
+            if not isinstance(seq, list):
+                continue
+            for item in seq:
+                url = str(item).strip()
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                merged.append(url)
+
+        return merged
 
     def _build_report_prompt(
         self,
@@ -622,6 +653,202 @@ class ReportSynthesizerNode(BaseNode):
 
         return report_text.rstrip() + "\n" + table
 
+    def _inject_competitor_comparison_table(
+        self,
+        report_text: str,
+        assessments: list[dict[str, Any]],
+        threats: list[dict[str, Any]],
+        competitor_profiles: Any,
+        target_technologies: Any,
+        target_competitors: Any,
+    ) -> str:
+        """경쟁사별 비교 표에 TRL 판단 근거(행별)를 포함하도록 테이블을 교체한다."""
+        if "### 경쟁사별 비교" not in report_text:
+            return report_text
+
+        table = self._build_competitor_comparison_table(
+            assessments=assessments,
+            threats=threats,
+            competitor_profiles=competitor_profiles,
+            target_technologies=target_technologies,
+            target_competitors=target_competitors,
+        )
+        if not table:
+            return report_text
+
+        # "### 경쟁사별 비교" 이후 첫 번째 마크다운 테이블 블록(| ... |)을 교체한다.
+        lines = report_text.splitlines()
+        try:
+            heading_idx = next(i for i, line in enumerate(lines) if line.strip() == "### 경쟁사별 비교")
+        except StopIteration:
+            return report_text
+
+        start = None
+        for i in range(heading_idx + 1, len(lines)):
+            if lines[i].lstrip().startswith("|"):
+                start = i
+                break
+            if lines[i].startswith("## "):
+                break
+        if start is None:
+            insert_at = heading_idx + 1
+            new_lines = [*lines[:insert_at], "", *table.splitlines(), "", *lines[insert_at:]]
+            return "\n".join(new_lines).strip()
+
+        end = start
+        while end < len(lines) and lines[end].lstrip().startswith("|"):
+            end += 1
+
+        new_lines = [*lines[:start], *table.splitlines(), *lines[end:]]
+        return "\n".join(new_lines).strip()
+
+    def _build_competitor_comparison_table(
+        self,
+        assessments: list[dict[str, Any]],
+        threats: list[dict[str, Any]],
+        competitor_profiles: Any,
+        target_technologies: Any,
+        target_competitors: Any,
+    ) -> str:
+        """상태값을 기반으로 경쟁사 비교 표를 생성한다(행별 TRL 근거 포함)."""
+        if not isinstance(assessments, list) or not assessments:
+            return ""
+
+        threat_map: dict[tuple[str, str], dict[str, Any]] = {}
+        if isinstance(threats, list):
+            for item in threats:
+                if not isinstance(item, dict):
+                    continue
+                competitor = str(item.get("competitor", "")).strip()
+                technology = str(item.get("technology", "")).strip()
+                if competitor and technology:
+                    threat_map[(technology, competitor)] = item
+
+        profile_map: dict[tuple[str, str], dict[str, Any]] = {}
+        if isinstance(competitor_profiles, dict):
+            for key, value in competitor_profiles.items():
+                if not isinstance(value, dict):
+                    continue
+                technology = str(value.get("technology", "")).strip()
+                competitor = str(value.get("company", "")).strip()
+                if not technology or not competitor:
+                    # fallback: key is "Company_Tech"
+                    parts = str(key).split("_", 1)
+                    if len(parts) == 2:
+                        competitor = competitor or parts[0]
+                        technology = technology or parts[1]
+                if technology and competitor:
+                    profile_map[(technology, competitor)] = value
+
+        def safe_float(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except Exception:  # noqa: BLE001
+                return default
+
+        def safe_int(value: Any, default: int = 0) -> int:
+            try:
+                return int(value)
+            except Exception:  # noqa: BLE001
+                return default
+
+        def build_rationale(item: dict[str, Any]) -> str:
+            trl_level = safe_int(item.get("trl_level", 0), 0)
+            note = str(item.get("assessment_note", "")).strip()
+            evidence = item.get("evidence", [])
+            ev = ""
+            if isinstance(evidence, list) and evidence:
+                ev = str(evidence[0]).strip()
+            base = note or ev or "공개 근거가 제한되어 간접 지표로 추정"
+            base = base.replace("\n", " ").strip()
+            if len(base) > 90:
+                base = base[:87].rstrip() + "..."
+
+            if trl_level in {4, 5, 6}:
+                return f"{base} (주의: TRL 4~6은 AI 추론 기반 → 신뢰하기 어려움)"
+            return base
+
+        def strategy_hint(technology: str, competitor: str) -> str:
+            profile = profile_map.get((technology, competitor), {})
+            if not isinstance(profile, dict):
+                return ""
+            diffs = profile.get("technical_differentiators", [])
+            parts: list[str] = []
+            if isinstance(diffs, list) and diffs:
+                parts.append(str(diffs[0]).strip())
+            partnerships = profile.get("partnerships", [])
+            if isinstance(partnerships, list) and partnerships:
+                parts.append(str(partnerships[0]).strip())
+            hint = " / ".join(p for p in parts if p)
+            return hint[:60]
+
+        rows_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in assessments:
+            if not isinstance(item, dict):
+                continue
+            technology = str(item.get("technology", "")).strip()
+            competitor = str(item.get("competitor", "")).strip()
+            if technology and competitor:
+                rows_by_key[(technology, competitor)] = item
+
+        techs = [str(t).strip() for t in (target_technologies if isinstance(target_technologies, list) else []) if str(t).strip()]
+        comps = [str(c).strip() for c in (target_competitors if isinstance(target_competitors, list) else []) if str(c).strip()]
+        if not techs:
+            techs = sorted({key[0] for key in rows_by_key.keys()})
+        if not comps:
+            comps = sorted({key[1] for key in rows_by_key.keys()})
+
+        header = (
+            "| 기술 | 경쟁사 | TRL | 서브레벨 | 신뢰도 | 위협도 | 차별화 전략 | TRL 판단 근거 |\n"
+            "|---|---|---:|---|---:|---:|---|---|\n"
+        )
+        body_lines: list[str] = []
+        for technology in techs:
+            for competitor in comps:
+                item = rows_by_key.get((technology, competitor))
+                if not item:
+                    continue
+                trl_level = safe_int(item.get("trl_level", 0), 0)
+                trl_sub = str(item.get("trl_sublevel", "")).strip() or "mid"
+                conf = safe_float(item.get("confidence", 0.0), 0.0)
+                threat = threat_map.get((technology, competitor), {})
+                threat_level = safe_int(threat.get("threat_level", 0), 0) if isinstance(threat, dict) else 0
+                hint = strategy_hint(technology, competitor)
+                rationale = build_rationale(item)
+                # 테이블 깨짐 방지
+                safe_hint = hint.replace("|", "/") if hint else "-"
+                safe_rat = rationale.replace("|", "/") if rationale else "-"
+                body_lines.append(
+                    f"| {technology} | {competitor} | {trl_level} | {trl_sub} | {conf:.2f} | {threat_level} | {safe_hint or '-'} | {safe_rat} |"
+                )
+
+        if not body_lines:
+            return ""
+        return header + "\n".join(body_lines)
+
+    def _replace_placeholder_citations(self, report_text: str, max_citation_id: int) -> str:
+        """[n] 같은 자리표시자 인용을 실제 숫자 인용으로 변환한다.
+
+        자리표시자가 새 번호를 무한정 생성하면 REFERENCE와 불일치가 발생하기 쉬우므로,
+        1..max_citation_id 범위 안에서 순환하며 치환한다.
+        """
+        placeholder = re.compile(r"\[\s*[nN]\s*\]")
+        if not placeholder.search(report_text):
+            return report_text
+
+        max_citation_id = max(1, int(max_citation_id or 1))
+        next_id = 1
+
+        def repl(_: re.Match[str]) -> str:
+            nonlocal next_id
+            value = next_id
+            next_id += 1
+            if next_id > max_citation_id:
+                next_id = 1
+            return f"[{value}]"
+
+        return placeholder.sub(repl, report_text)
+
     def _inject_trl_rationale(
         self,
         report_text: str,
@@ -652,51 +879,83 @@ class ReportSynthesizerNode(BaseNode):
         assessments: list[dict[str, Any]],
         citation_catalog: list[dict[str, Any]],
     ) -> str:
-        """TRL 판단 근거 섹션 마크다운을 생성한다."""
+        """TRL 판단 근거 섹션 마크다운을 생성한다.
+
+        경쟁사별 비교 표의 각 행(기술/경쟁사)마다 TRL 근거를 1줄로 제공한다.
+        """
         if not assessments:
             return ""
 
-        def as_float(value: Any, default: float = 0.0) -> float:
+        def safe_int(value: Any, default: int = 0) -> int:
             try:
-                return float(value)
+                return int(value)
             except Exception:  # noqa: BLE001
                 return default
 
-        lines: list[str] = []
-        lines.append("### TRL 판단 근거")
+        def safe_text(value: Any) -> str:
+            text = str(value or "").replace("\n", " ").strip()
+            return text
+
+        def sanitize_cell(text: str, limit: int = 120) -> str:
+            cleaned = safe_text(text).replace("|", "/")
+            if len(cleaned) > limit:
+                cleaned = cleaned[: limit - 3].rstrip() + "..."
+            return cleaned
+
+        rows: list[dict[str, str]] = []
         for item in assessments:
             if not isinstance(item, dict):
                 continue
-            technology = str(item.get("technology", "")).strip()
-            competitor = str(item.get("competitor", "")).strip()
-            trl_level = str(item.get("trl_level", "")).strip()
-            trl_sublevel = str(item.get("trl_sublevel", "")).strip()
-            basis = str(item.get("assessment_basis", "")).strip()
-            confidence = as_float(item.get("confidence", 0.0), 0.0)
-            note = str(item.get("assessment_note", "")).strip()
+            technology = safe_text(item.get("technology", ""))
+            competitor = safe_text(item.get("competitor", ""))
+            if not technology or not competitor:
+                continue
+            trl_level = safe_int(item.get("trl_level", 0), 0)
+            basis = safe_text(item.get("assessment_basis", ""))
+            note = safe_text(item.get("assessment_note", ""))
             evidence = item.get("evidence", [])
             gaps = item.get("information_gaps", [])
 
-            header = f"- **{technology} / {competitor}**: TRL {trl_level} ({trl_sublevel}), basis={basis}, confidence={confidence:.2f}"
-            lines.append(header)
-            if note:
-                lines.append(f"  - 판단 요약: {note}")
-
+            ev_text = ""
             if isinstance(evidence, list) and evidence:
-                lines.append("  - 근거:")
-                for ev in evidence[:3]:
-                    ev_text = str(ev).strip()
-                    if not ev_text:
-                        continue
-                    ev_text = self._append_catalog_citation(ev_text, citation_catalog)
-                    lines.append(f"    - {ev_text}")
+                ev_text = sanitize_cell(self._append_catalog_citation(safe_text(evidence[0]), citation_catalog), limit=140)
 
+            gap_text = ""
             if isinstance(gaps, list) and gaps:
-                gap_texts = [str(g).strip() for g in gaps if str(g).strip()]
-                if gap_texts:
-                    lines.append(f"  - 정보 공백: {', '.join(gap_texts[:3])}")
+                gap_texts = [safe_text(g) for g in gaps if safe_text(g)]
+                gap_text = sanitize_cell(", ".join(gap_texts[:2]), limit=120)
 
-        return "\n".join(lines).strip()
+            rationale = sanitize_cell(note or ev_text or "공개 근거가 제한되어 간접 지표로 추정", limit=140)
+            caution = ""
+            if trl_level in {4, 5, 6}:
+                caution = "TRL 4~6은 공개 근거 제한으로 AI 추론(간접 지표) 기반 → 신뢰하기 어려움"
+
+            rows.append(
+                {
+                    "technology": technology,
+                    "competitor": competitor,
+                    "trl": str(trl_level),
+                    "basis": basis or "-",
+                    "rationale": rationale or "-",
+                    "evidence": ev_text or "-",
+                    "gaps": gap_text or "-",
+                    "caution": caution or "-",
+                }
+            )
+
+        if not rows:
+            return ""
+
+        header = (
+            "### TRL 판단 근거\n"
+            "| 기술 | 경쟁사 | TRL | basis | 판단 근거(요약) | 대표 근거(1) | 정보 공백 | 신뢰성 주의 |\n"
+            "|---|---|---:|---|---|---|---|---|\n"
+        )
+        body = "\n".join(
+            f"| {r['technology']} | {r['competitor']} | {r['trl']} | {r['basis']} | {r['rationale']} | {r['evidence']} | {r['gaps']} | {r['caution']} |"
+            for r in rows
+        )
+        return (header + body).strip()
 
     def _append_catalog_citation(self, text: str, citation_catalog: list[dict[str, Any]]) -> str:
         """evidence 문장에 포함된 URL을 citation_catalog와 매칭해 [id] 인용을 덧붙인다."""
@@ -733,6 +992,11 @@ class ReportSynthesizerNode(BaseNode):
         candidate_items = state.get("reference_items", [])
         if not candidate_items:
             candidate_items = [{"title": "Untitled", "url": url, "published_date": "", "company": "Unknown"} for url in state.get("references", [])]
+        if not candidate_items:
+            candidate_items = [
+                {"title": "RAG retrieved source", "url": url, "published_date": "", "company": "RAG"}
+                for url in state.get("rag_sources", [])
+            ]
 
         catalog: list[dict[str, Any]] = []
         seen_urls: set[str] = set()
@@ -772,6 +1036,16 @@ class ReportSynthesizerNode(BaseNode):
             end = next_heading.start() if next_heading else len(text)
             text = (text[:start].rstrip() + "\n\n" + text[end:].lstrip()).strip()
 
+        # Markdown heading이 아닌 평문 형태의 "REFERENCE" 섹션(예: "7. REFERENCE")도 제거한다.
+        # 이 섹션은 보통 문서 말미에 위치하므로, 발견 시 해당 라인부터 끝까지 잘라낸다.
+        plain_reference = re.compile(
+            r"^[ \t]*(?:\d+\.\s*)?REFERENCE(?:S)?\s*$",
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        match = plain_reference.search(text)
+        if match:
+            text = text[: match.start()].rstrip()
+
         return text.strip()
 
     def _replace_reference_section(
@@ -782,12 +1056,17 @@ class ReportSynthesizerNode(BaseNode):
     ) -> str:
         """REFERENCE 섹션을 번호+APA 스타일로 정규화하고, WEB/RAG로 분리해 출력한다."""
         report_text = self._strip_existing_reference_sections(report_text)
+        if not citation_catalog:
+            return f"{report_text.rstrip()}\n\n## REFERENCE\n- 수집된 출처가 없어 REFERENCE를 생성할 수 없습니다."
         normalized_text, ordered_sources = self._normalize_citation_numbers(
             report_text, citation_catalog, rag_sources=rag_sources
         )
         apa_lines = self._build_apa_references(ordered_sources)
         marker = "## REFERENCE"
-        return f"{normalized_text.rstrip()}\n\n{marker}\n{self._format_reference_sections(apa_lines, ordered_sources, rag_sources)}"
+        return (
+            f"{normalized_text.rstrip()}\n\n{marker}\n"
+            f"{self._format_reference_sections(apa_lines, ordered_sources, rag_sources)}"
+        )
 
     def _normalize_citation_numbers(
         self,
@@ -847,7 +1126,7 @@ class ReportSynthesizerNode(BaseNode):
         ordered_sources: list[dict[str, Any] | None],
         rag_sources: set[str] | None,
     ) -> str:
-        """REFERENCE를 WEB/RAG 두 섹션으로 나눠 출력한다."""
+        """REFERENCE를 WEB/RAG 두 섹션으로 나눠 보기 좋은 리스트로 출력한다."""
         rag_sources = rag_sources or set()
         web_lines: list[str] = []
         rag_lines: list[str] = []
@@ -859,25 +1138,23 @@ class ReportSynthesizerNode(BaseNode):
             return bool(url and url in rag_sources)
 
         for line, source in zip(apa_lines, ordered_sources, strict=False):
-            # Markdown 렌더러가 줄바꿈을 합쳐버리는 경우가 있어, blockquote + hard line break로 강제한다.
-            formatted = f"> {line}  "
             if is_rag_line(source):
-                rag_lines.append(formatted)
+                rag_lines.append(line)
             else:
-                web_lines.append(formatted)
+                web_lines.append(line)
 
         chunks: list[str] = []
         if web_lines:
             chunks.append("### WEB SEARCH")
-            chunks.extend(web_lines)
+            chunks.extend([f"- {line}" for line in web_lines])
         if rag_lines:
             if chunks:
                 chunks.append("")
             chunks.append("### RAG (Vector DB)")
-            chunks.extend(rag_lines)
+            chunks.extend([f"- {line}" for line in rag_lines])
 
         if not chunks:
-            return "> [1] Author Unknown. (n.d.). Untitled. Retrieved from unknown source  "
+            return "- [1] Author Unknown. (n.d.). Untitled. Retrieved from unknown source"
         return "\n".join(chunks).rstrip()
 
     def _build_apa_references(self, ordered_sources: list[dict[str, Any] | None]) -> list[str]:
